@@ -50,7 +50,7 @@ rand = "0.8.4"
 structopt = {version = "0.3.23", optional = true}
 
 [dependencies.rusqlite]
-features = ["functions", "blob", "bundled", "array"]
+features = ["functions", "blob", "vtab"]
 package = "rusqlite"
 version = "0.35.0"
 
