@@ -34,6 +34,11 @@ fn def_incremental_compression_step_bytes() -> i64 {
     // about 5MB/s at level 19
     5_000_000 / 3
 }
+fn def_max_dict_train_bytes() -> i64 {
+    // zstd's FASTCOVER_MAX_SAMPLES_SIZE is (unsigned)-1 on 64-bit
+    // The check is >=, so max allowed is 4,294,967,294
+    4_294_967_294
+}
 
 /// This is the configuration of the transparent compression for one column of one table.
 /// It is safe to change every property of this configuration at any time except for table and column, but data that is already compressed will not be recompressed with the new settings.
@@ -87,6 +92,10 @@ pub struct TransparentCompressConfig {
     /// how many bytes (approximately) to compress at once. By default tuned so at compression level 19 it locks the database for about 0.3s per step.
     #[serde(default = "def_incremental_compression_step_bytes")]
     pub incremental_compression_step_bytes: i64,
+    /// Maximum bytes to use for dictionary training. zstd's limit is ~4GB on 64-bit.
+    /// If the calculated training size exceeds this, it will be clamped.
+    #[serde(default = "def_max_dict_train_bytes")]
+    pub max_dict_train_bytes: i64,
 }
 
 pub fn pretty_bytes(bytes: i64) -> String {
@@ -947,13 +956,27 @@ fn get_or_train_dict(
                 );
                 return Ok(TrainDictReturn::Skip);
             }
-            let target_samples = (dict_target_size as f32 * config.train_dict_samples_ratio
+            let mut target_samples = (dict_target_size as f32 * config.train_dict_samples_ratio
                 / avg_sample_bytes as f32) as i64; // use roughly 100x the size of the dictionary as data
 
+            // Clamp training bytes to max_dict_train_bytes (zstd limit is ~4GB on 64-bit)
+            let estimated_train_bytes = target_samples * avg_sample_bytes;
+            if estimated_train_bytes > config.max_dict_train_bytes {
+                target_samples = config.max_dict_train_bytes / avg_sample_bytes;
+                log::debug!(
+                    "Clamping training samples from {} to {} (max_dict_train_bytes={})",
+                    estimated_train_bytes / avg_sample_bytes,
+                    target_samples,
+                    pretty_bytes(config.max_dict_train_bytes)
+                );
+            }
+
             log::debug!(
-                "Training dict for key {} of max size {}",
+                "Training dict for key {} of max size {} using {} samples (~{})",
                 dict_choice,
-                pretty_bytes(dict_target_size)
+                pretty_bytes(dict_target_size),
+                target_samples,
+                pretty_bytes(target_samples * avg_sample_bytes)
             );
             let dict_id = db.query_row(&format!(
                 "select zstd_train_dict_and_save({datacol}, ?, ?, ?) as dictid from {tbl} where {dictcol} is null and ? = ({chooser})", 
