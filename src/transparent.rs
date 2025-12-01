@@ -731,7 +731,7 @@ fn maintenance_for_config(
             "select
             ({chooser}) as dict_choice,
             count(*) as count,
-            sum(length({datacol})) as total_bytes
+            coalesce(sum(length({datacol})), 0) as total_bytes
         from {tbl} where {dictcol} is null group by dict_choice",
             tbl = esc_names.compressed_tablename,
             dictcol = esc_names.dict_colname,
@@ -816,7 +816,13 @@ fn maintenance_for_todo(
         };
 
     let mut total_updated: i64 = 0;
-    let mut chunk_size = config.incremental_compression_step_bytes / avg_sample_bytes;
+    // Handle zero-byte data: if avg_sample_bytes is 0, compress all rows at once
+    // since each row contributes 0 bytes to the incremental step target
+    let mut chunk_size = if avg_sample_bytes > 0 {
+        config.incremental_compression_step_bytes / avg_sample_bytes
+    } else {
+        todo.count
+    };
     if chunk_size < 1 {
         chunk_size = 1;
     }
@@ -1310,5 +1316,145 @@ mod tests {
             params![r#"{"table": "events", "column": "another_col", "compression_level": 3, "dict_chooser": "'1'"}"#],
             |_| Ok(())
         ).unwrap();
+    }
+
+    #[test]
+    fn empty_string_data_does_not_panic() -> anyhow::Result<()> {
+        // Test that maintenance handles empty string data (0 bytes) without panicking.
+        // This reproduces a bug where dividing by avg_sample_bytes=0 caused a panic.
+        let db = Connection::open_in_memory()?;
+        super::add_functions::add_functions(&db)?;
+
+        db.execute_batch(
+            "CREATE TABLE test_empty (
+                id INTEGER PRIMARY KEY,
+                data TEXT,
+                category TEXT
+            );"
+        )?;
+
+        // Insert rows with real data to train a dictionary
+        for i in 0..1000 {
+            let data = format!("data content {} {}", i, "x".repeat(500));
+            db.execute(
+                "INSERT INTO test_empty (id, data, category) VALUES (?, ?, 'a')",
+                params![i, data],
+            )?;
+        }
+
+        // Enable transparent compression
+        db.query_row(
+            r#"SELECT zstd_enable_transparent(?)"#,
+            params![r#"{"table": "test_empty", "column": "data", "compression_level": 3, "dict_chooser": "'a'", "min_dict_size_bytes_for_training": 100}"#],
+            |_| Ok(())
+        )?;
+
+        // Run maintenance to compress existing data and train dictionary
+        loop {
+            let result: i64 = db.query_row(
+                "SELECT zstd_incremental_maintenance(9999999, 1)",
+                params![],
+                |r| r.get(0),
+            )?;
+            if result == 0 {
+                break;
+            }
+        }
+
+        // Verify all rows are compressed
+        let uncompressed: i64 = db.query_row(
+            "SELECT count(*) FROM _test_empty_zstd WHERE _data_dict IS NULL",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(uncompressed, 0, "All rows should be compressed");
+
+        // Insert rows with empty string data (the bug scenario)
+        for i in 1000..1020 {
+            db.execute(
+                "INSERT INTO test_empty (id, data, category) VALUES (?, '', 'a')",
+                params![i],
+            )?;
+        }
+
+        // Run maintenance on empty data - should not panic
+        let result: i64 = db.query_row(
+            "SELECT zstd_incremental_maintenance(9999999, 1)",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(result, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn null_data_does_not_panic() -> anyhow::Result<()> {
+        // Test that maintenance handles NULL data without panicking.
+        // This reproduces a bug where sum(length(NULL)) returned NULL, causing a conversion error.
+        let db = Connection::open_in_memory()?;
+        super::add_functions::add_functions(&db)?;
+
+        db.execute_batch(
+            "CREATE TABLE test_null (
+                id INTEGER PRIMARY KEY,
+                data TEXT,
+                category TEXT
+            );"
+        )?;
+
+        // Insert rows with real data to train a dictionary
+        for i in 0..1000 {
+            let data = format!("data content {} {}", i, "x".repeat(500));
+            db.execute(
+                "INSERT INTO test_null (id, data, category) VALUES (?, ?, 'a')",
+                params![i, data],
+            )?;
+        }
+
+        // Enable transparent compression
+        db.query_row(
+            r#"SELECT zstd_enable_transparent(?)"#,
+            params![r#"{"table": "test_null", "column": "data", "compression_level": 3, "dict_chooser": "'a'", "min_dict_size_bytes_for_training": 100}"#],
+            |_| Ok(())
+        )?;
+
+        // Run maintenance to compress existing data and train dictionary
+        loop {
+            let result: i64 = db.query_row(
+                "SELECT zstd_incremental_maintenance(9999999, 1)",
+                params![],
+                |r| r.get(0),
+            )?;
+            if result == 0 {
+                break;
+            }
+        }
+
+        // Verify all rows are compressed
+        let uncompressed: i64 = db.query_row(
+            "SELECT count(*) FROM _test_null_zstd WHERE _data_dict IS NULL",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(uncompressed, 0, "All rows should be compressed");
+
+        // Insert rows with NULL data (the bug scenario)
+        for i in 1000..1020 {
+            db.execute(
+                "INSERT INTO test_null (id, data, category) VALUES (?, NULL, 'a')",
+                params![i],
+            )?;
+        }
+
+        // Run maintenance on NULL data - should not panic or error
+        let result: i64 = db.query_row(
+            "SELECT zstd_incremental_maintenance(9999999, 1)",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(result, 0);
+
+        Ok(())
     }
 }
